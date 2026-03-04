@@ -1,0 +1,78 @@
+name: Regression Tests
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run regression tests
+        run: npx playwright test --grep @regression --project=chromium --project=api
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Publish the Playwright HTML report to S3.
+  #
+  # Prerequisites (configure in your repo / org settings):
+  #   Vars:  AWS_REGION, AWS_S3_BUCKET, AWS_IAM_ROLE
+  #
+  # This job only runs when the regression job fails.
+  # Change the `if` condition to `always()` if you want reports on every run.
+  # ---------------------------------------------------------------------------
+  publish_report:
+    name: Publish HTML Report
+    if: ${{ failure() }}
+    needs: [regression]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Replace with your IAM role ARN or use repo-level vars
+          role-to-assume: ${{ vars.AWS_IAM_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Download report artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+
+      - name: Upload report to S3
+        id: s3
+        env:
+          REPORT_DIR: playwright-report-${{ github.run_id }}
+        run: |
+          echo "REPORT_DIR=$REPORT_DIR" >> $GITHUB_ENV
+          aws s3 cp playwright-report/ s3://${{ vars.AWS_S3_BUCKET }}/$REPORT_DIR --recursive
+
+      - name: Generate report URL
+        run: |
+          REPORT_URL="https://${{ vars.AWS_S3_BUCKET }}.s3.${{ vars.AWS_REGION }}.amazonaws.com/${{ env.REPORT_DIR }}/index.html"
+          echo "🔗 [View Playwright Report]($REPORT_URL)" >> $GITHUB_STEP_SUMMARY

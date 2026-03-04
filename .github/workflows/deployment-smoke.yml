@@ -1,0 +1,281 @@
+# ---------------------------------------------------------------------------
+# Deployment-triggered smoke test run.
+#
+# Triggered via repository_dispatch when a deployment completes.
+# Runs the @smoke suite, posts results to Slack, and publishes
+# the HTML report to S3.
+#
+# Prerequisites (configure in your repo / org settings):
+#   Secrets:  SLACK_BOT_TOKEN, TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET
+#   Vars:     AWS_REGION, AWS_S3_BUCKET, AWS_IAM_ROLE, SLACK_CHANNEL
+#
+# Payload expected from the dispatch event:
+#   {
+#     "clustername":  "stage | prod-eu1 | prod-us1 | ...",
+#     "appname":      "my-service",
+#     "author":       "Deployer Name",
+#     "initiator":    "github-username",
+#     "initiatorIsAutoSync": "true|false",
+#     "repository":   "org/repo"
+#   }
+# ---------------------------------------------------------------------------
+
+name: Deployment Smoke Tests
+
+on: [repository_dispatch]
+
+env:
+  SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL }}
+  CLUSTER_NAME: ${{ github.event.client_payload.clustername }}
+  APP_NAME: ${{ github.event.client_payload.appname }}
+  DEPLOY_USER: ${{ github.event.client_payload.author }}
+  INITIATOR: ${{ github.event.client_payload.initiator }}
+  INITIATOR_IS_AUTO_SYNC: ${{ github.event.client_payload.initiatorIsAutoSync }}
+  REPO: ${{ github.event.client_payload.repository }}
+  # Map cluster names to short environment identifiers.
+  # Adapt the JSON object below to match your infrastructure.
+  ENV: >-
+    ${{
+      (fromJson('{
+        "stage":    "stage",
+        "prod-eu1": "eu1",
+        "prod-eu2": "eu2",
+        "prod-us1": "us1"
+      }')[github.event.client_payload.clustername]) || github.event.client_payload.clustername
+    }}
+
+permissions:
+  id-token: write
+  contents: write
+
+concurrency:
+  group: >-
+    ${{
+      (fromJson('{
+        "stage":    "stage",
+        "prod-eu1": "eu1",
+        "prod-eu2": "eu2",
+        "prod-us1": "us1"
+      }')[github.event.client_payload.clustername]) || github.event.client_payload.clustername
+    }}
+  cancel-in-progress: true
+
+jobs:
+  # ----- Debug: dump the dispatch payload -----
+  print_event:
+    name: Print event
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dump GitHub context
+        env:
+          GITHUB_CONTEXT: ${{ toJson(github) }}
+        run: echo "$GITHUB_CONTEXT"
+
+  # ----- Main test job -----
+  test:
+    name: Run smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      message_slack_ts: ${{ steps.message-slack.outputs.ts }}
+    container:
+      image: mcr.microsoft.com/playwright:v1.50.0-noble
+      options: --privileged
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # --- Slack: notify test run started ---
+      - name: Resolve deploy initiator
+        run: |
+          initiatorIsAutoSync="${{ env.INITIATOR_IS_AUTO_SYNC }}"
+          appName="${{ env.APP_NAME }}"
+          initiator="${{ env.INITIATOR }}"
+
+          if [ "$initiatorIsAutoSync" = "true" ]; then
+            message="Automated sync initiated a deployment for \`$appName\`."
+          elif [ -z "$initiator" ] || [ "$initiator" = "null" ]; then
+            message="A deployment was triggered for \`$appName\`."
+          else
+            message="\`$initiator\` initiated a deployment for \`$appName\`."
+          fi
+
+          echo "SLACK_DEPLOYMENT_MESSAGE=$message" >> "$GITHUB_ENV"
+
+      - name: Post message — test run started
+        id: message-slack
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: '${{ env.SLACK_DEPLOYMENT_MESSAGE }} Test run has started – please wait for the test results.'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      # --- Setup ---
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_IAM_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Load secrets from AWS Secrets Manager
+        uses: aws-actions/aws-secretsmanager-get-secrets@v2
+        with:
+          secret-ids: |
+            tests/ui
+          parse-json-secrets: true
+
+      - name: Record start time
+        id: start
+        run: echo "start_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Gather run metadata
+        run: |
+          echo "RUN_NUMBER=${{ github.run_number }}" >> "$GITHUB_ENV"
+          echo "RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$GITHUB_ENV"
+          echo "DATE=$(date +%s)" >> "$GITHUB_ENV"
+
+      # --- Run tests ---
+      - name: Run Playwright smoke tests
+        id: run
+        run: ENV="${{ env.ENV }}" npx playwright test --grep @smoke --project=chromium --project=api --reporter=html
+        env:
+          # Map secret manager keys to env vars your tests expect.
+          # Adapt these to your project's needs.
+          DEMOQA_USERNAME: ${{ env.TESTS_UI_DEMOQA_USERNAME }}
+          DEMOQA_PASSWORD: ${{ env.TESTS_UI_DEMOQA_PASSWORD }}
+
+      # --- Post-run: timing, status, Slack update ---
+      - name: Determine result icon and color
+        if: always()
+        run: |
+          case "${{ steps.run.outcome }}" in
+            success)   echo "COLOR=55d81a" >> "$GITHUB_ENV"; echo "ICON=✅" >> "$GITHUB_ENV" ;;
+            failure)   echo "COLOR=f44336" >> "$GITHUB_ENV"; echo "ICON=❌" >> "$GITHUB_ENV" ;;
+            *)         echo "COLOR=999999" >> "$GITHUB_ENV"; echo "ICON=🔘" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Record end time
+        if: always()
+        id: end
+        run: echo "end_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Calculate duration
+        if: always()
+        id: time
+        run: |
+          start_time=$(date -d "${{ steps.start.outputs.start_date }}" -u +%s)
+          end_time=$(date -d "${{ steps.end.outputs.end_date }}" -u +%s)
+          duration=$((end_time - start_time))
+          if [ $duration -lt 60 ]; then
+            echo "duration=${duration}s" >> $GITHUB_OUTPUT
+          else
+            echo "duration=$((duration / 60))m" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update Slack message — test run finished
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          update-ts: ${{ steps.message-slack.outputs.ts }}
+          slack-message: '${{ env.ICON }} ${{ env.SLACK_DEPLOYMENT_MESSAGE }} Test run finished with status `${{ steps.run.outcome }}`.'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Post Slack reply — run details
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          payload: |
+            {
+              "thread_ts": "${{ steps.message-slack.outputs.ts }}",
+              "text": "Deployment test run finished with status `${{ steps.run.outcome }}`",
+              "attachments": [
+                {
+                  "color": "${{ env.COLOR }}",
+                  "pretext": "Test run in `${{ env.ENV }}` for `${{ env.APP_NAME }}`",
+                  "title": "Smoke run #${{ github.run_number }}",
+                  "title_link": "${{ env.RUN_URL }}",
+                  "fields": [
+                    {
+                      "title": "Duration",
+                      "value": "${{ steps.time.outputs.duration }}",
+                      "short": true
+                    }
+                  ],
+                  "ts": ${{ env.DATE }}
+                }
+              ]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+  # ----- Publish HTML report to S3 -----
+  publish_report:
+    name: Publish HTML Report
+    if: ${{ success() || failure() }}
+    needs: [test]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_IAM_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Download report artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+
+      - name: Upload report to S3
+        env:
+          REPORT_DIR: playwright-report-${{ github.run_id }}
+        run: |
+          echo "REPORT_DIR=$REPORT_DIR" >> $GITHUB_ENV
+          aws s3 cp playwright-report/ s3://${{ vars.AWS_S3_BUCKET }}/$REPORT_DIR --recursive
+
+      - name: Generate report URL
+        run: |
+          REPORT_URL="https://${{ vars.AWS_S3_BUCKET }}.s3.${{ vars.AWS_REGION }}.amazonaws.com/${{ env.REPORT_DIR }}/index.html"
+          echo "URL=$REPORT_URL" >> "$GITHUB_ENV"
+          echo "🔗 [View Playwright Report]($REPORT_URL)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Post report link to Slack thread
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          channel-id: ${{ vars.SLACK_CHANNEL }}
+          payload: |
+            {
+              "thread_ts": "${{ needs.test.outputs.message_slack_ts }}",
+              "text": "`Report` successfully generated. You can see it by accessing the link below.",
+              "attachments": [
+                {
+                  "color": "808080",
+                  "title": "Report for smoke run #${{ github.run_number }}",
+                  "title_link": "${{ env.URL }}"
+                }
+              ]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
