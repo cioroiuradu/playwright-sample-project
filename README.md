@@ -12,6 +12,11 @@ A test automation sample project built with [Playwright](https://playwright.dev/
 ## Project Structure
 
 ```
+├── .github/workflows/
+│   ├── regression.yml          # Runs @regression on PRs → publishes report to S3
+│   └── deployment-smoke.yml    # Runs @smoke on deploy → Slack notifications + S3 report
+├── scripts/
+│   └── loadSecrets.sh          # Populate .env from AWS Secrets Manager
 ├── playwright.config.ts        # Playwright configuration
 ├── src/
 │   ├── pages/                  # Page Object Model classes
@@ -19,12 +24,10 @@ A test automation sample project built with [Playwright](https://playwright.dev/
 │   │   ├── LoginPage.ts        # Login page selectors & actions
 │   │   ├── BookStorePage.ts    # Book Store page selectors & actions
 │   │   └── ElementsPage.ts    # Elements page (text box, checkbox, radio)
-│   ├── utils.ts                # Shared helpers (delay, withRetry)
+│   ├── utils.ts                # Shared helpers (delay)
 │   ├── services/               # Service layer
 │   │   ├── ApiClient.ts        # Generic HTTP client wrapper
 │   │   ├── AuthService.ts      # DemoQA auth API (alternative to UI login)
-│   │   ├── MongoService.ts     # MongoDB service (placeholder)
-│   │   ├── ElasticsearchService.ts  # Elasticsearch service (placeholder)
 │   │   └── MailService.ts      # Email service (nodemailer / Ethereal)
 │   ├── fixtures/
 │   │   └── test-fixtures.ts    # Custom Playwright fixtures with POM
@@ -172,26 +175,6 @@ The project showcases various Playwright selector strategies:
 
 Authenticates via the DemoQA API instead of the UI — useful for skipping the login UI, generating auth tokens, or faster test setup.
 
-### MongoService
-
-Generic MongoDB wrapper with `findOne`, `findMany`, `insertOne`, `updateOne`, `deleteOne`. Connects via `MONGO_URI` / `MONGO_DB` env vars. Supports retry with configurable attempts and interval.
-
-```typescript
-const mongo = await MongoService.create();
-const user = await mongo.findOne('users', { email: 'a@b.com' });
-await mongo.close();
-```
-
-### ElasticsearchService
-
-Generic Elasticsearch wrapper with `findOne`, `search`, and `indexExists`. Connects via `ELASTICSEARCH_NODE` with API key or basic auth. Supports retry with configurable attempts and interval.
-
-```typescript
-const es = await ElasticsearchService.create('my-index-*');
-const doc = await es.findOne({ email: 'a@b.com' });
-await es.close();
-```
-
 ### MailService
 
 Email service built on nodemailer. Defaults to **Ethereal Email** — a free disposable SMTP provider that captures emails without actually delivering them. Each sent message gets a preview URL you can open in a browser.
@@ -210,4 +193,52 @@ mail.close();
 
 To use your own SMTP server, set `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` in `.env` and call `MailService.create()` instead.
 
-> Database and mail services are **placeholders** — adapt them to your project's needs.
+> Services are **placeholders** — adapt them to your project's needs.
+
+## CI/CD Workflows
+
+### Regression on PRs — `regression.yml`
+
+Triggers on every pull request to `main`.
+
+| Step | Details |
+|---|---|
+| **Tests** | Runs `@regression` tagged tests on Chromium + API projects |
+| **Report** | Uploads Playwright HTML report as a GitHub artifact |
+| **S3 publish** | On failure, uploads the report to S3 and adds a link to the job summary |
+
+Required repo vars: `AWS_REGION`, `AWS_S3_BUCKET`, `AWS_IAM_ROLE`
+
+### Deployment Smoke — `deployment-smoke.yml`
+
+Triggers via `repository_dispatch` when a deployment completes.
+
+| Step | Details |
+|---|---|
+| **Trigger** | `repository_dispatch` with a payload containing `clustername`, `appname`, `author`, `initiator` |
+| **Tests** | Always runs the `@smoke` suite (Chromium + API) |
+| **Slack** | Posts a message when tests start, updates it on finish, and replies with run details (duration, status, link) |
+| **S3 publish** | Uploads the report to S3 and posts the link in the Slack thread |
+| **Concurrency** | Grouped by environment — only one run per cluster at a time |
+
+Required repo vars: `AWS_REGION`, `AWS_S3_BUCKET`, `AWS_IAM_ROLE`, `SLACK_CHANNEL`
+Required secrets: `SLACK_BOT_TOKEN`
+
+#### Triggering a deployment smoke run
+
+```bash
+curl -X POST \
+  -H "Authorization: token $GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github.v3+json" \
+  https://api.github.com/repos/OWNER/REPO/dispatches \
+  -d '{
+    "event_type": "deployment",
+    "client_payload": {
+      "clustername": "stage",
+      "appname": "my-service",
+      "author": "Jane Doe",
+      "initiator": "janedoe",
+      "initiatorIsAutoSync": "false"
+    }
+  }'
+```
